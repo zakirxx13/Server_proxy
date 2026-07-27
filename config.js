@@ -13,5 +13,12 @@ export const CONFIG = {
         ALLOW_CREDENTIALS: true
     },
     CACHE_CONTROL: 'no-store, no-cache, must-revalidate, proxy-revalidate',
-    ERROR_PAGE_SIZE_THRESHOLD: 2000
+    ERROR_PAGE_SIZE_THRESHOLD: 2000,
+    UPSTREAM_CONCURRENCY: parseInt(process.env.UPSTREAM_CONCURRENCY || '12', 10),
+    UPSTREAM_RETRY: parseInt(process.env.UPSTREAM_RETRY || '2', 10),
+    UPSTREAM_RETRY_BASE_MS: parseInt(process.env.UPSTREAM_RETRY_BASE_MS || '400', 10),
+    UPSTREAM_RETRY_MAX_MS: parseInt(process.env.UPSTREAM_RETRY_MAX_MS || '4000', 10),
+    UPSTREAM_RETRY_JITTER_MS: parseInt(process.env.UPSTREAM_RETRY_JITTER_MS || '250', 10),
+    SEGMENT_CACHE_CONTROL: process.env.SEGMENT_CACHE_CONTROL || 'public, max-age=604800, immutable',
+    PLAYLIST_CACHE_CONTROL: process.env.PLAYLIST_CACHE_CONTROL || ''
 };

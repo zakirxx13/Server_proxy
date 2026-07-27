@@ -1,11 +1,15 @@
 import { CONFIG } from './config.js';
-import { createRequire } from 'module';
-
-const require = createRequire(import.meta.url);
-const cloudscraper = require('cloudscraper');
+import { gotScraping } from 'got-scraping';
 
 const DOWNLOAD_REFERER = 'https://kwik.cx/';
 const FORWARDED_RESPONSE_HEADERS = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag'];
+
+const HEADER_GEN = {
+    browsers: [{ name: 'chrome', minVersion: 120 }],
+    devices: ['desktop'],
+    operatingSystems: ['windows'],
+    locales: ['en-US', 'en'],
+};
 
 function downloadOriginAllowed(origin) {
     const allowed = CONFIG.ALLOWED_ORIGINS;
@@ -51,20 +55,20 @@ export async function handleDownload(req, res) {
     let filename = decodeURIComponent(req.path.split('/').pop() || '') || 'video.mp4';
     filename = filename.replace(/[\r\n]/g, '');
 
-    const headers = {
-        'User-Agent': CONFIG.DEFAULT_USER_AGENT,
-        'Referer': DOWNLOAD_REFERER,
-        'Accept': '*/*',
-    };
+    const headers = { 'Referer': DOWNLOAD_REFERER };
     if (req.headers.range) headers['Range'] = req.headers.range;
 
-    const upstream = cloudscraper({
+    const upstream = gotScraping.stream({
         method: req.method === 'HEAD' ? 'HEAD' : 'GET',
-        uri: target.href,
+        url: target.href,
         headers,
-        encoding: null,
-        strictSSL: false,
-        followAllRedirects: true,
+        throwHttpErrors: false,
+        followRedirect: true,
+        decompress: false,
+        https: { rejectUnauthorized: false },
+        timeout: { request: 30000 },
+        retry: { limit: 0 },
+        headerGeneratorOptions: HEADER_GEN,
     });
 
     let responded = false;
@@ -79,14 +83,21 @@ export async function handleDownload(req, res) {
         res.status(resp.statusCode);
     });
 
+    upstream.on('data', (chunk) => {
+        if (res.writableEnded || res.destroyed) return;
+        if (!res.write(chunk)) {
+            upstream.pause();
+            res.once('drain', () => upstream.resume());
+        }
+    });
+    upstream.on('end', () => { if (!res.writableEnded) res.end(); });
+
     upstream.on('error', (e) => {
         if (!responded && !res.headersSent) res.status(502).send(`Upstream fetch failed: ${e.message}`);
         else res.destroy();
     });
 
-    res.on('close', () => { try { upstream.abort(); } catch { /* noop */ } });
-
-    upstream.pipe(res);
+    res.on('close', () => { try { upstream.destroy(); } catch { /* noop */ } });
 }
 
 export function registerDownloadRoutes(app) {

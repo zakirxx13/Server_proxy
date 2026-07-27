@@ -1,12 +1,9 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createRequire } from 'module';
 import { CONFIG } from './config.js';
 import { registerDownloadRoutes } from './download-handler.js';
-
-const require = createRequire(import.meta.url);
-const cloudscraper = require('cloudscraper');
+import { fetchUpstream } from './upstream.js';
 
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -146,11 +143,25 @@ function setCorsHeaders(req, res) {
     res.setHeader('Access-Control-Allow-Methods', CONFIG.CORS.ALLOW_METHODS);
     res.setHeader('Access-Control-Allow-Headers', CONFIG.CORS.ALLOW_HEADERS);
     res.setHeader('Access-Control-Expose-Headers', CONFIG.CORS.EXPOSE_HEADERS);
+    res.setHeader('X-Proxy-By', 'm3u8-proxy');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+}
+
+function setNoStore(res) {
     res.setHeader('Cache-Control', CONFIG.CACHE_CONTROL);
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
-    res.setHeader('X-Proxy-By', 'm3u8-proxy');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
+}
+
+function setCacheable(res, value) {
+    res.setHeader('Cache-Control', value);
+    res.removeHeader('Pragma');
+    res.removeHeader('Expires');
+}
+
+function applyPlaylistCache(res) {
+    if (CONFIG.PLAYLIST_CACHE_CONTROL) setCacheable(res, CONFIG.PLAYLIST_CACHE_CONTROL);
+    else setNoStore(res);
 }
 
 function generateProxyUrl(targetUrl, headersParam) {
@@ -214,7 +225,10 @@ app.get("/m3u8-proxy", async (req, res) => {
         const headersParam = req.query.headers ? decodeURIComponent(req.query.headers) : "";
         const headers = buildUpstreamHeaders(req, url, headersParam);
 
-        const ignoreTls = url.pathname.endsWith(".mp4"); 
+        const hasRange = !!req.headers.range;
+        const dedupeKey = hasRange ? null : `${url.href}\n${headersParam}`;
+
+        const ignoreTls = url.pathname.endsWith(".mp4");
 
         const options = {
             method: 'GET',
@@ -227,7 +241,7 @@ app.get("/m3u8-proxy", async (req, res) => {
         };
 
         try {
-            const targetResponse = await cloudscraper(options);
+            const targetResponse = await fetchUpstream(options, dedupeKey);
 
             updateCookieJar(url, targetResponse);
             setCorsHeaders(req, res);
@@ -240,10 +254,12 @@ app.get("/m3u8-proxy", async (req, res) => {
             if (isPlaylist) {
                 const content = targetResponse.body.toString('utf8');
                 const proxiedContent = proxyPlaylistContent(content, url, headersParam);
+                applyPlaylistCache(res);
                 res.setHeader('Content-Type', "application/vnd.apple.mpegurl");
                 res.status(200).send(proxiedContent);
             } else {
                 if (targetResponse.statusCode >= 400) {
+                    setNoStore(res);
                     const bodyStr = targetResponse.body.toString('utf8');
                     return safeSend(targetResponse.statusCode, {
                         message: "Upstream returned error",
@@ -257,6 +273,12 @@ app.get("/m3u8-proxy", async (req, res) => {
                         res.setHeader(k, v);
                     }
                 });
+                
+                if (!hasRange && targetResponse.statusCode === 200) {
+                    setCacheable(res, CONFIG.SEGMENT_CACHE_CONTROL);
+                } else {
+                    setNoStore(res);
+                }
 
                 res.writeHead(targetResponse.statusCode);
                 res.end(targetResponse.body);
