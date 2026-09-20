@@ -1,37 +1,22 @@
-const ALLOWED_METHODS = "GET, HEAD, OPTIONS";
-
 export default {
-  async fetch(request) {
-    const requestUrl = new URL(request.url);
+  async fetch(request, env) {
+    const url = new URL(request.url);
 
-    // CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: corsHeaders()
+        headers: cors()
       });
     }
 
-    // Only GET / HEAD
     if (request.method !== "GET" && request.method !== "HEAD") {
-      return json(
-        {
-          error: "Method Not Allowed"
-        },
-        405
-      );
+      return json({ error: "Method Not Allowed" }, 405);
     }
 
-    // Read target URL
-    const target = requestUrl.searchParams.get("url");
+    const target = url.searchParams.get("url");
 
     if (!target) {
-      return json(
-        {
-          error: "Missing url parameter"
-        },
-        400
-      );
+      return json({ error: "Missing url parameter" }, 400);
     }
 
     let targetUrl;
@@ -39,198 +24,110 @@ export default {
     try {
       targetUrl = new URL(target);
     } catch {
-      return json(
-        {
-          error: "Invalid URL",
-          target
-        },
-        400
-      );
+      return json({ error: "Invalid URL" }, 400);
     }
 
-    // Only HTTPS
     if (targetUrl.protocol !== "https:") {
-      return json(
-        {
-          error: "Only HTTPS URLs are allowed"
-        },
-        400
-      );
+      return json({ error: "HTTPS required" }, 400);
     }
 
     try {
-      /*
-       * Build upstream headers.
-       * Do not send an empty Range header.
-       */
-      const upstreamHeaders = new Headers();
+      const headers = new Headers({
+        "User-Agent": env.STREAM_USER_AGENT || "Mozilla/5.0",
+        "Accept": "*/*"
+      });
 
-      upstreamHeaders.set(
-        "User-Agent",
-        request.headers.get("User-Agent") ||
-          "Mozilla/5.0"
-      );
-
-      upstreamHeaders.set(
-        "Accept",
-        request.headers.get("Accept") ||
-          "*/*"
-      );
+      // Only for your own/authorized upstream.
+      if (env.STREAM_COOKIE) {
+        headers.set("Cookie", env.STREAM_COOKIE);
+      }
 
       const range = request.headers.get("Range");
 
       if (range) {
-        upstreamHeaders.set("Range", range);
+        headers.set("Range", range);
       }
 
-      /*
-       * Fetch upstream.
-       */
       const upstream = await fetch(targetUrl.href, {
         method: request.method,
-        headers: upstreamHeaders,
+        headers,
         redirect: "follow"
       });
 
-      /*
-       * Copy basic response headers.
-       */
-      const responseHeaders = new Headers(
-        corsHeaders()
-      );
+      if (!upstream.ok) {
+        return json({
+          error: "Upstream request failed",
+          status: upstream.status,
+          statusText: upstream.statusText
+        }, upstream.status);
+      }
 
-      copyHeader(
-        upstream,
-        responseHeaders,
-        "content-type"
-      );
-
-      copyHeader(
-        upstream,
-        responseHeaders,
-        "content-length"
-      );
-
-      copyHeader(
-        upstream,
-        responseHeaders,
-        "content-range"
-      );
-
-      copyHeader(
-        upstream,
-        responseHeaders,
-        "accept-ranges"
-      );
-
-      copyHeader(
-        upstream,
-        responseHeaders,
-        "etag"
-      );
-
-      copyHeader(
-        upstream,
-        responseHeaders,
-        "last-modified"
-      );
-
-      /*
-       * Detect M3U8.
-       */
       const contentType =
         upstream.headers.get("content-type") || "";
 
-      const isPlaylist =
-        targetUrl.pathname
-          .toLowerCase()
-          .endsWith(".m3u8") ||
-        contentType
-          .toLowerCase()
-          .includes("mpegurl") ||
-        contentType
-          .toLowerCase()
-          .includes("mpeg-url");
+      const isM3U8 =
+        targetUrl.pathname.toLowerCase().endsWith(".m3u8") ||
+        contentType.toLowerCase().includes("mpegurl");
 
-      /*
-       * HEAD request.
-       */
-      if (request.method === "HEAD") {
-        if (isPlaylist) {
+      const responseHeaders = new Headers(cors());
+
+      if (isM3U8) {
+        if (request.method === "HEAD") {
           responseHeaders.set(
             "Content-Type",
             "application/vnd.apple.mpegurl"
           );
-        }
 
-        return new Response(null, {
-          status: upstream.status,
-          headers: responseHeaders
-        });
-      }
-
-      /*
-       * Upstream HTTP error.
-       */
-      if (!upstream.ok) {
-        let errorBody = "";
-
-        try {
-          errorBody = await upstream.text();
-        } catch {
-          errorBody = "";
-        }
-
-        return json(
-          {
-            error: "Upstream request failed",
+          return new Response(null, {
             status: upstream.status,
-            statusText: upstream.statusText,
-            contentType,
-            body: errorBody.substring(0, 1000)
-          },
-          upstream.status
-        );
-      }
+            headers: responseHeaders
+          });
+        }
 
-      /*
-       * Handle M3U8 playlist.
-       */
-      if (isPlaylist) {
         const playlist = await upstream.text();
 
-        /*
-         * Sometimes a URL ending in .m3u8 may return
-         * HTML or another non-playlist response.
-         */
-        if (
-          !playlist
-            .trimStart()
-            .startsWith("#EXTM3U")
-        ) {
-          responseHeaders.set(
-            "Content-Type",
-            contentType ||
-              "application/octet-stream"
-          );
-
-          return new Response(
-            playlist,
-            {
-              status: upstream.status,
-              headers: responseHeaders
-            }
-          );
+        if (!playlist.trimStart().startsWith("#EXTM3U")) {
+          return new Response(playlist, {
+            status: upstream.status,
+            headers: responseHeaders
+          });
         }
 
-        /*
-         * Rewrite playlist URLs.
-         */
-        const rewritten = rewritePlaylist(
-          playlist,
-          targetUrl,
-          requestUrl
-        );
+        const rewritten = playlist
+          .split(/\r?\n/)
+          .map(line => {
+            const trimmed = line.trim();
+
+            if (!trimmed) return line;
+
+            if (trimmed.startsWith("#")) {
+              return line.replace(
+                /(URI\s*=\s*["'])([^"']+)(["'])/gi,
+                (match, prefix, uri, suffix) => {
+                  try {
+                    const absolute =
+                      new URL(uri, targetUrl.href).href;
+
+                    return prefix +
+                      makeProxyUrl(url, absolute) +
+                      suffix;
+                  } catch {
+                    return match;
+                  }
+                }
+              );
+            }
+
+            try {
+              const absolute =
+                new URL(trimmed, targetUrl.href).href;
+
+              return makeProxyUrl(url, absolute);
+            } catch {
+              return line;
+            }
+          })
+          .join("\n");
 
         responseHeaders.set(
           "Content-Type",
@@ -239,24 +136,25 @@ export default {
 
         responseHeaders.set(
           "Cache-Control",
-          "no-cache, no-store"
+          "no-cache"
         );
 
-        return new Response(
-          rewritten,
-          {
-            status: 200,
-            headers: responseHeaders
-          }
-        );
+        return new Response(rewritten, {
+          status: 200,
+          headers: responseHeaders
+        });
       }
 
-      /*
-       * Non-playlist response:
-       * TS / M4S / MP4 / key / other media.
-       */
+      copyHeader(upstream, responseHeaders, "content-type");
+      copyHeader(upstream, responseHeaders, "content-length");
+      copyHeader(upstream, responseHeaders, "content-range");
+      copyHeader(upstream, responseHeaders, "accept-ranges");
+      copyHeader(upstream, responseHeaders, "etag");
+
       return new Response(
-        upstream.body,
+        request.method === "HEAD"
+          ? null
+          : upstream.body,
         {
           status: upstream.status,
           headers: responseHeaders
@@ -264,189 +162,51 @@ export default {
       );
 
     } catch (error) {
-      /*
-       * This makes Worker runtime errors visible
-       * instead of producing an unexplained response.
-       */
-      return json(
-        {
-          error: "Worker proxy exception",
-          name: error?.name || "Error",
-          message:
-            error?.message ||
-            String(error)
-        },
-        502
-      );
+      return json({
+        error: "Worker exception",
+        message: error?.message || String(error)
+      }, 502);
     }
   }
 };
 
-
-/*
- * Rewrite M3U8 playlist.
- */
-function rewritePlaylist(
-  playlist,
-  targetUrl,
-  requestUrl
-) {
-  return playlist
-    .split(/\r?\n/)
-    .map((line) => {
-      const trimmed = line.trim();
-
-      /*
-       * Empty lines.
-       */
-      if (!trimmed) {
-        return line;
-      }
-
-      /*
-       * HLS tag.
-       *
-       * Examples:
-       *
-       * #EXT-X-KEY:URI="..."
-       * #EXT-X-MAP:URI="..."
-       * #EXT-X-MEDIA:URI="..."
-       */
-      if (trimmed.startsWith("#")) {
-        return line.replace(
-          /(URI\s*=\s*["'])([^"']+)(["'])/gi,
-          (match, prefix, uri, suffix) => {
-            try {
-              const absolute =
-                new URL(
-                  uri,
-                  targetUrl.href
-                ).href;
-
-              return (
-                prefix +
-                makeProxyUrl(
-                  requestUrl,
-                  absolute
-                ) +
-                suffix
-              );
-            } catch {
-              return match;
-            }
-          }
-        );
-      }
-
-      /*
-       * Media segment or child playlist.
-       *
-       * Example:
-       *
-       * segment001.ts
-       * 720p/index.m3u8
-       * https://example.com/video.ts
-       */
-      try {
-        const absolute =
-          new URL(
-            trimmed,
-            targetUrl.href
-          ).href;
-
-        return makeProxyUrl(
-          requestUrl,
-          absolute
-        );
-      } catch {
-        return line;
-      }
-    })
-    .join("\n");
-}
-
-
-/*
- * Create another proxy URL.
- */
-function makeProxyUrl(
-  workerRequestUrl,
-  target
-) {
-  const proxyUrl =
-    new URL(
-      workerRequestUrl.origin +
-        workerRequestUrl.pathname
-    );
-
-  proxyUrl.searchParams.set(
-    "url",
-    target
+function makeProxyUrl(workerUrl, target) {
+  const proxy = new URL(
+    workerUrl.origin + workerUrl.pathname
   );
 
-  return proxyUrl.toString();
+  proxy.searchParams.set("url", target);
+
+  return proxy.toString();
 }
 
-
-/*
- * CORS headers.
- */
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-
-    "Access-Control-Allow-Methods":
-      ALLOWED_METHODS,
-
-    "Access-Control-Allow-Headers":
-      "Content-Type, Range",
-
-    "Access-Control-Expose-Headers":
-      "Content-Length, Content-Range, Accept-Ranges, Content-Type, ETag",
-
-    "Vary": "Origin",
-
-    "X-Content-Type-Options":
-      "nosniff"
-  };
-}
-
-
-/*
- * Copy a response header.
- */
-function copyHeader(
-  source,
-  target,
-  name
-) {
-  const value =
-    source.headers.get(name);
+function copyHeader(source, target, name) {
+  const value = source.headers.get(name);
 
   if (value) {
     target.set(name, value);
   }
 }
 
+function cors() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Range",
+    "Access-Control-Expose-Headers":
+      "Content-Length, Content-Range, Accept-Ranges, Content-Type, ETag"
+  };
+}
 
-/*
- * JSON response helper.
- */
 function json(data, status) {
   return new Response(
-    JSON.stringify(
-      data,
-      null,
-      2
-    ),
+    JSON.stringify(data, null, 2),
     {
       status,
       headers: {
-        "Content-Type":
-          "application/json; charset=utf-8",
-
-        ...corsHeaders()
+        "Content-Type": "application/json",
+        ...cors()
       }
     }
   );
-      }
+}
